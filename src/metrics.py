@@ -42,6 +42,20 @@ class PlayerMetrics:
         return self.total_distance_m / 1000.0
 
 
+@dataclass
+class BallMetrics:
+    """
+    Stores ball movement metrics.
+
+    Attributes:
+        total_distance_m: Total distance the ball traveled in meters.
+        positions: List of (X, Y) positions in meters over time.
+    """
+
+    total_distance_m: float
+    positions: List[Point2D]
+
+
 def compute_distance(positions: List[Point2D]) -> float:
     """
     Compute total path length from a sequence of positions.
@@ -72,3 +86,21 @@ def compute_player_metrics(
         metrics[track_id] = PlayerMetrics(total_distance_m=dist, positions=positions)
     return metrics
 
+
+def compute_ball_metrics(
+    ball_positions: Dict[TrackID, List[Point2D]]
+) -> Dict[TrackID, BallMetrics]:
+    """
+    Compute basic metrics for each ball track.
+
+    Args:
+        ball_positions: Mapping from ball track ID to list of pitch positions.
+
+    Returns:
+        Mapping from ball track ID to :class:`BallMetrics`.
+    """
+    metrics: Dict[TrackID, BallMetrics] = {}
+    for ball_id, positions in ball_positions.items():
+        dist = compute_distance(positions)
+        metrics[ball_id] = BallMetrics(total_distance_m=dist, positions=positions)
+    return metrics

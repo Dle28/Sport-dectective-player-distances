@@ -24,6 +24,10 @@ except ImportError:  # pragma: no cover - optional dependency
 BoundingBox = Tuple[int, int, int, int]
 Frame = np.ndarray[Any, np.dtype[np.uint8]]
 
+# Default class IDs for a custom players+ball detector.
+PLAYER_CLASS_IDS: Tuple[int, ...] = (0,)
+BALL_CLASS_IDS: Tuple[int, ...] = (1,)
+
 
 class Detector(Protocol):
     """
@@ -74,21 +78,40 @@ class YoloDetector:
             )
         self._model = YOLO(self.model_path)
 
-    def detect(self, frame: Frame) -> List[Tuple[BoundingBox, float]]:
+    def _run_model(self, frame: Frame):  # type: ignore[no-any-return]
         """
-        Run YOLO detection on the given frame and return player bounding boxes.
-
-        This implementation filters for the 'person' class (COCO id 0)
-        by default, unless `classes` is provided explicitly.
+        Internal helper to run the underlying YOLO model.
         """
-        results = self._model(  # type: ignore[misc]
+        return self._model(  # type: ignore[misc]
             frame,
             conf=self.conf_threshold,
             iou=self.iou_threshold,
             classes=self.classes,
             verbose=False,
         )
-        detections: List[Tuple[BoundingBox, float]] = []
+
+    def detect_players_and_ball(
+        self,
+        frame: Frame,
+        player_class_ids: Sequence[int] = PLAYER_CLASS_IDS,
+        ball_class_ids: Sequence[int] = BALL_CLASS_IDS,
+    ) -> Tuple[List[Tuple[BoundingBox, float]], List[Tuple[BoundingBox, float]]]:
+        """
+        Run YOLO once and return separate detections for players and ball.
+
+        Args:
+            frame: Input BGR image.
+            player_class_ids: Class IDs to treat as players.
+            ball_class_ids: Class IDs to treat as ball.
+
+        Returns:
+            (player_detections, ball_detections) where each element is a list of
+            (bbox, confidence) tuples.
+        """
+        results = self._run_model(frame)  # type: ignore[no-untyped-call]
+
+        player_dets: List[Tuple[BoundingBox, float]] = []
+        ball_dets: List[Tuple[BoundingBox, float]] = []
 
         for result in results:  # type: ignore[attr-defined]
             boxes = result.boxes  # type: ignore[attr-defined]
@@ -98,17 +121,28 @@ class YoloDetector:
             conf = boxes.conf.cpu().numpy()  # type: ignore[attr-defined]
             xyxy = boxes.xyxy.cpu().numpy()  # type: ignore[attr-defined]
             for c, score, box in zip(cls, conf, xyxy):  # type: ignore[arg-type]
-                # If no explicit class filter is provided, keep only 'person' (COCO id 0).
-                if self.classes is None and c != 0:
-                    continue
                 coords = box.astype(int)  # type: ignore[attr-defined]
                 x1: int = int(coords[0])  # type: ignore[arg-type]
                 y1: int = int(coords[1])  # type: ignore[arg-type]
                 x2: int = int(coords[2])  # type: ignore[arg-type]
                 y2: int = int(coords[3])  # type: ignore[arg-type]
                 bbox: BoundingBox = (x1, y1, x2, y2)
-                detections.append((bbox, float(score)))  # type: ignore[arg-type]
-        return detections
+                if c in player_class_ids:
+                    player_dets.append((bbox, float(score)))  # type: ignore[arg-type]
+                elif c in ball_class_ids:
+                    ball_dets.append((bbox, float(score)))  # type: ignore[arg-type]
+        return player_dets, ball_dets
+
+    def detect(self, frame: Frame) -> List[Tuple[BoundingBox, float]]:
+        """
+        Run YOLO detection on the given frame and return player bounding boxes.
+
+        This method is kept for backwards compatibility and returns only
+        player detections. Use :meth:`detect_players_and_ball` when ball
+        detections are also needed.
+        """
+        players, _ = self.detect_players_and_ball(frame)
+        return players
 
 
 class DummyDetector:

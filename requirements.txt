@@ -2,5 +2,6 @@ numpy
 opencv-python
 ultralytics
 matplotlib
+pyyaml
 
 deep-sort-realtime

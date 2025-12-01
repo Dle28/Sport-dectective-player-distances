@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generator, Tuple, Optional
+from typing import Any, Generator, Tuple
 
 import cv2
 import numpy as np
@@ -64,15 +64,14 @@ class VideoReader:
             if not ret:
                 break
             if idx % stride == 0:
-                yield idx, frame
+                yield idx, frame  # type: ignore[misc]
             idx += 1
 
     def release(self) -> None:
         """
         Release the underlying video capture object.
         """
-        if self._cap is not None:
-            self._cap.release()
+        self._cap.release()
 
 
 def open_video(path: Path) -> VideoReader:
@@ -100,9 +99,9 @@ class VideoWriter:
     codec: str = "mp4v"
 
     def __post_init__(self) -> None:
-        fourcc = cv2.VideoWriter_fourcc(*self.codec)
+        fourcc = cv2.VideoWriter_fourcc(*self.codec)  # type: ignore[attr-defined]
         w, h = self.frame_size
-        self._writer = cv2.VideoWriter(str(self.path), fourcc, self.fps, (w, h))
+        self._writer = cv2.VideoWriter(str(self.path), fourcc, self.fps, (w, h))  # type: ignore[arg-type]
         if not self._writer.isOpened():
             raise IOError(f"Could not open video writer: {self.path}")
 
@@ -116,8 +115,7 @@ class VideoWriter:
         """
         Release the underlying video writer.
         """
-        if self._writer is not None:
-            self._writer.release()
+        self._writer.release()
 
 
 def open_video_writer(path: Path, fps: float, frame_size: Tuple[int, int], codec: str = "mp4v") -> VideoWriter:

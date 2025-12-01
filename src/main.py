@@ -1,48 +1,166 @@
 """
 Entry point for the football player tracking pipeline.
 
-This script demonstrates a minimal working example that:
-- Loads a broadcast-style video.
-- Runs player detection and simple IOU-based tracking.
-- Assigns team labels based on jersey color.
-- Maps positions to pitch coordinates via a homography.
-- Computes per-player distance covered.
-- Saves a heatmap image for one selected player.
+This script wires together:
+- Player detection (YOLO or dummy)
+- Multi-object tracking
+- Pitch calibration and coordinate conversion
+- Distance and simple possession metrics
+- Optional heatmap generation
 
-Requirements (install via pip):
-    pip install opencv-python numpy ultralytics
+It can be run from the command line, for example:
 
-Before running:
-    1. Place your input video at the path configured in `Config`.
-    2. Provide a calibration JSON file with image/pitch correspondences.
-    3. Optionally, download YOLO weights (e.g., yolov8n.pt) to `models/`.
+    python -m src.main \\
+        --video_path data/sample_match.mp4 \\
+        --pitch_type 11 \\
+        --pitch_length 105 \\
+        --pitch_width 68 \\
+        --calib_points data/calibration_points.json \\
+        --output_dir outputs/
 
-Run:
-    python -m src.main
+Pitch dimensions can also be configured via ``config.yaml``; see the README.
 """
 
 from __future__ import annotations
 
+import argparse
+import csv
+import json
 from collections import defaultdict
 from math import hypot
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Tuple, Optional, cast
 
 import cv2
 
+try:
+    import yaml  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency
+    yaml = None  # type: ignore[assignment]
+
 from .config import DEFAULT_CONFIG, Config
-from .detection import BoundingBox, YoloDetector, create_detector
-from .tracking import create_tracker, TrackID
-from .team_classifier import create_team_classifier
-from .calibration import load_calibrator, Point2D
-from .metrics import compute_ball_metrics, compute_player_metrics
+from .detection import Detection, YoloDetector, create_detector
+from .tracking import TrackID, create_player_tracker
+from .team_classifier import TeamLabel, create_team_classifier
+from .calibration import Point2D, load_calibrator
+from .metrics import (
+    TrackPointXY,
+    compute_ball_metrics,
+    compute_distance_per_player,
+    compute_player_metrics,
+)
 from .heatmap import create_heatmap, save_heatmap
 from .visualization import draw_tracks, overlay_heatmap_on_pitch
 from .utils.video_io import open_video, open_video_writer
 
 
+def _load_yaml_config(config_path: Path) -> Dict[str, Any]:
+    """
+    Load a YAML configuration file if it exists.
+
+    The file is optional; when missing, an empty dict is returned.
+    """
+    if not config_path.exists():
+        return {}
+    if yaml is None:
+        raise ImportError(
+            "pyyaml is required to load config.yaml. "
+            "Install it with `pip install pyyaml` or via requirements.txt."
+        )
+    with config_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}  # type: ignore[no-untyped-call]
+    if not isinstance(data, dict):
+        raise ValueError("config.yaml must contain a top-level mapping.")
+    return cast(Dict[str, Any], data)
+
+
+def _get_pitch_size_from_config(
+    cfg: Dict[str, Any],
+    pitch_type: int,
+) -> Tuple[float, float]:
+    """
+    Look up default pitch dimensions for a given ``pitch_type``.
+
+    Values are read from ``config.yaml`` under ``pitch_types``, with keys
+    like ``\"5\"``, ``\"7\"``, and ``\"11\"``. If they are not found,
+    reasonable hard-coded defaults are used.
+    """
+    pitch_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("pitch_types", {}) or {})
+    key = str(pitch_type)
+    if key in pitch_cfg:
+        dims: Dict[str, Any] = cast(Dict[str, Any], pitch_cfg.get(key, {}) or {})
+        length = float(cast(Any, dims.get("length_m")) or cast(Any, dims.get("length")) or 0.0)
+        width = float(cast(Any, dims.get("width_m")) or cast(Any, dims.get("width")) or 0.0)
+        if length > 0.0 and width > 0.0:
+            return length, width
+
+    # Simple hard-coded defaults as a fallback.
+    if pitch_type == 5:
+        return 40.0, 20.0
+    if pitch_type == 7:
+        return 50.0, 30.0
+    # Default to a standard 11-a-side pitch.
+    return 105.0, 68.0
+
+
+def _get_model_path_from_config(cfg: Dict[str, Any], default_path: Path) -> Path:
+    """
+    Resolve YOLO model path, optionally overridden by ``config.yaml``.
+    """
+    model_cfg: Dict[str, Any] = cast(Dict[str, Any], cfg.get("model", {}) or {})
+    path_str: Optional[str] = cast(Optional[str], model_cfg.get("yolo_model_path"))
+    if path_str:
+        return Path(path_str)
+    return default_path
+
+
+def build_config_from_args(args: argparse.Namespace) -> Config:
+    """
+    Construct a :class:`Config` instance from CLI arguments and optional YAML.
+    """
+    # Start from code defaults.
+    config = Config()
+
+    # Load optional YAML config near the project root.
+    default_config_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    config_path = Path(args.config) if args.config is not None else default_config_path
+    yaml_cfg = _load_yaml_config(config_path) if config_path.exists() else {}
+
+    # Paths
+    if args.video_path is not None:
+        config.input_video = Path(args.video_path)
+    if args.output_dir is not None:
+        config.output_dir = Path(args.output_dir)
+
+    # Model path: CLI > YAML > default.
+    if args.model_path is not None:
+        config.yolo_model_path = Path(args.model_path)
+    else:
+        config.yolo_model_path = _get_model_path_from_config(
+            yaml_cfg, config.yolo_model_path
+        )
+
+    # Calibration file.
+    if args.calib_points is not None:
+        config.calibration_file = Path(args.calib_points)
+
+    # Pitch dimensions: pitch_type from YAML, then CLI overrides.
+    if args.pitch_type is not None:
+        length, width = _get_pitch_size_from_config(yaml_cfg, args.pitch_type)
+        config.pitch_length_m = length
+        config.pitch_width_m = width
+
+    if args.pitch_length is not None:
+        config.pitch_length_m = float(args.pitch_length)
+    if args.pitch_width is not None:
+        config.pitch_width_m = float(args.pitch_width)
+
+    return config
+
+
 def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
     """
-    Run the full detection → tracking → metrics → heatmap pipeline.
+    Run the full detection + tracking + metrics + visualization pipeline.
     """
     config.ensure_output_dirs()
 
@@ -54,18 +172,26 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
         classes=config.detection_classes,
         use_dummy_if_unavailable=True,
     )
-    player_tracker = create_tracker(
+    player_tracker = create_player_tracker(
         tracker_type=config.tracker_type,
         max_age=config.tracking_max_age,
         iou_threshold=config.tracking_iou_threshold,
     )
-    ball_tracker = create_tracker(
+    ball_tracker = create_player_tracker(
         tracker_type=config.tracker_type,
         max_age=config.tracking_max_age,
         iou_threshold=config.tracking_iou_threshold,
     )
     team_classifier = create_team_classifier()
-    calibrator = load_calibrator(config.calibration_file) if config.calibration_file else None
+    calibrator = (
+        load_calibrator(
+            config.calibration_file,
+            pitch_length_m=config.pitch_length_m,
+            pitch_width_m=config.pitch_width_m,
+        )
+        if config.calibration_file is not None
+        else None
+    )
 
     video = open_video(config.input_video)
     fps = video.fps
@@ -73,37 +199,67 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
     # Track positions in pitch coordinates for each player and ball over time.
     track_positions: Dict[TrackID, List[Point2D]] = {}
     ball_positions: Dict[TrackID, List[Point2D]] = {}
+    # Track positions with frame indices for robust distance computation.
+    track_points_xy: Dict[TrackID, List[TrackPointXY]] = {}
+    # Optional: raw pixel-space positions (frame_idx, u, v) for debugging/export.
+    pixel_track_points_uv: Dict[TrackID, List[Tuple[int, float, float]]] = {}
 
     # Approximate ball possession: number of frames each player is closest
     # to the ball within a small radius in pitch space.
     possession_frames: Dict[TrackID, int] = defaultdict(int)
+
+    # Keep a stable team label per track (last seen label wins).
+    track_team_labels: Dict[TrackID, TeamLabel] = {}
 
     # Optional: write an annotated video for debugging.
     output_video_path = config.output_dir / "annotated.mp4"
     writer = None
 
     try:
-        for _, frame in video.frames(stride=config.frame_stride):
+        for frame_idx, frame in video.frames(stride=config.frame_stride):
             # Run detection; if using YOLO, get both players and ball.
             if isinstance(detector, YoloDetector):
-                player_detections, ball_detections = detector.detect_players_and_ball(frame)
+                player_detections, ball_detections = detector.detect_players_and_ball(
+                    frame
+                )
             else:
                 player_detections = detector.detect(frame)
-                ball_detections: List[Tuple[BoundingBox, float]] = []
+                ball_detections: List[Detection] = []
 
             player_tracks = player_tracker.update(player_detections, frame=frame)
-            ball_tracks = ball_tracker.update(ball_detections, frame=frame) if ball_detections else {}
+            ball_tracks = (
+                ball_tracker.update(ball_detections, frame=frame)
+                if ball_detections
+                else {}
+            )
 
             # Classify each track into a team.
             team_labels = team_classifier.classify_tracks(frame, player_tracks)
+            track_team_labels.update(team_labels)
+
+            # Pre-compute centers of all player boxes in pixels.
+            frame_player_centers_uv: Dict[TrackID, Tuple[float, float]] = {}
+            for track_id, bbox in player_tracks.items():
+                x1, y1, x2, y2 = bbox
+                u = (x1 + x2) / 2.0
+                v = (y1 + y2) / 2.0
+                center_uv = (float(u), float(v))
+                frame_player_centers_uv[track_id] = center_uv
+                pixel_track_points_uv.setdefault(track_id, []).append(
+                    (frame_idx, center_uv[0], center_uv[1])
+                )
 
             # Convert track positions from image to pitch coordinates.
             if calibrator is not None:
                 frame_player_positions: Dict[TrackID, Point2D] = {}
-                for track_id, bbox in player_tracks.items():
-                    pt = calibrator.bbox_center_to_pitch(bbox)
+                for track_id, center_uv in frame_player_centers_uv.items():
+                    pt = calibrator.image_point_to_pitch(center_uv)
                     track_positions.setdefault(track_id, []).append(pt)
                     frame_player_positions[track_id] = pt
+                    # Store time-stamped pitch coordinates for distance metrics.
+                    track_points_xy.setdefault(track_id, []).append(
+                        (frame_idx, pt[0], pt[1])
+                    )
 
                 frame_ball_positions: Dict[TrackID, Point2D] = {}
                 for ball_id, bbox in ball_tracks.items():
@@ -114,6 +270,7 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
                 # Update possession statistics: which player is closest to
                 # the ball this frame (within 2 meters).
                 if frame_ball_positions and frame_player_positions:
+                    # For now, assume a single detected ball per frame.
                     _, ball_pt = next(iter(frame_ball_positions.items()))
                     closest_id: TrackID | None = None
                     closest_dist = float("inf")
@@ -143,25 +300,28 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
                     )
                 writer.write(vis)
 
-            # OPTIONAL: show preview window
-            # cv2.imshow("Tracking", vis)
-            # if cv2.waitKey(1) & 0xFF == 27:
-            #     break
-
     finally:
         video.release()
         if writer is not None:
             writer.release()
         cv2.destroyAllWindows()
 
+    if calibrator is None:
+        # Without calibration, we cannot compute metric distances.
+        print("No calibration provided; skipping distance metrics.")
+        return
+
     # Compute metrics once all frames have been processed.
     metrics = compute_player_metrics(track_positions)
     _ball_metrics = compute_ball_metrics(ball_positions) if ball_positions else {}
 
+    # Distance per player with simple outlier rejection.
+    distance_per_player = compute_distance_per_player(track_points_xy, fps=fps)
+
     # Convert possession frame counts into seconds.
-    possession_seconds: Dict[TrackID, float] = {}
-    for track_id, frame_count in possession_frames.items():
-        possession_seconds[track_id] = frame_count / fps
+    possession_seconds: Dict[TrackID, float] = {
+        track_id: frame_count / fps for track_id, frame_count in possession_frames.items()
+    }
 
     # Save a simple heatmap for one player (e.g., the first track).
     if metrics:
@@ -179,18 +339,115 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
         save_heatmap(heatmap_path, heatmap_img)
         save_heatmap(overlay_path, heatmap_overlay)
 
-    # Optionally, save metrics to disk as JSON/CSV.
-    # TODO: Implement JSON/CSV serialization for per-player stats.
+    # Export per-player stats to JSON and CSV.
+    stats_rows: List[Dict[str, Any]] = []
+    for track_id, distance_m in distance_per_player.items():
+        team_label = track_team_labels.get(track_id, "")
+        row: Dict[str, Any] = {
+            "player_id": int(track_id),
+            "team": team_label,
+            "total_distance_m": float(distance_m),
+            "total_distance_km": float(distance_m) / 1000.0,
+            "possession_seconds": float(possession_seconds.get(track_id, 0.0)),
+        }
+        stats_rows.append(row)
+
+    if stats_rows:
+        stats_dir = config.stats_dir
+        json_path = stats_dir / "player_distances.json"
+        csv_path = stats_dir / "player_distances.csv"
+
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(stats_rows, f, indent=2)
+
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            writer_csv = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "player_id",
+                    "team",
+                    "total_distance_m",
+                    "total_distance_km",
+                    "possession_seconds",
+                ],
+            )
+            writer_csv.writeheader()
+            writer_csv.writerows(stats_rows)
+
+        # Also print a compact summary to the console.
+        print("Per-player summary:")
+        for row in stats_rows:
+            team_display = row["team"] or "?"
+            print(
+                f"  Player {row['player_id']} (team {team_display}): "
+                f"{row['total_distance_m']:.1f} m "
+                f"({row['total_distance_km']:.2f} km), "
+                f"possession {row['possession_seconds']:.1f} s"
+            )
+    else:
+        print("No player tracks with valid calibration; no stats to export.")
 
 
 def main() -> None:
     """
-    CLI entrypoint for running the pipeline with default configuration.
+    CLI entrypoint for running the full pipeline.
 
-    TODO: Add argparse to override config parameters from the command line,
-    such as input video path or model weights.
+    Use ``python -m src.main --help`` for available options.
     """
-    run_pipeline()
+    parser = argparse.ArgumentParser(
+        description="Football player tracking and distance analysis.",
+    )
+    parser.add_argument(
+        "--video_path",
+        type=str,
+        help="Path to input video file.",
+    )
+    parser.add_argument(
+        "--pitch_type",
+        type=int,
+        choices=[5, 7, 11],
+        help=(
+            "Pitch type: 5, 7, or 11-a-side. Used together with "
+            "config.yaml to choose default pitch dimensions."
+        ),
+    )
+    parser.add_argument(
+        "--pitch_length",
+        type=float,
+        help="Pitch length in meters (overrides pitch_type/default).",
+    )
+    parser.add_argument(
+        "--pitch_width",
+        type=float,
+        help="Pitch width in meters (overrides pitch_type/default).",
+    )
+    parser.add_argument(
+        "--calib_points",
+        type=str,
+        help="Path to calibration points JSON file.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        help="Directory for output videos, stats, and heatmaps.",
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        help="Path to YOLO model weights file.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        help=(
+            "Optional path to YAML config file "
+            "(defaults to config.yaml in the project root)."
+        ),
+    )
+
+    args = parser.parse_args()
+    config = build_config_from_args(args)
+    run_pipeline(config)
 
 
 if __name__ == "__main__":

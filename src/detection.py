@@ -29,6 +29,22 @@ PLAYER_CLASS_IDS: Tuple[int, ...] = (0,)
 BALL_CLASS_IDS: Tuple[int, ...] = (1,)
 
 
+@dataclass
+class Detection:
+    """
+    Single detection result from a model.
+
+    Attributes:
+        bbox: Bounding box coordinates (x1, y1, x2, y2) in pixels.
+        confidence: Detection confidence score in [0, 1].
+        class_id: Integer class ID (e.g., 0 for player/person).
+    """
+
+    bbox: BoundingBox
+    confidence: float
+    class_id: int
+
+
 class Detector(Protocol):
     """
     Protocol for detector implementations.
@@ -36,7 +52,7 @@ class Detector(Protocol):
     Concrete implementations must provide a :meth:`detect` method.
     """
 
-    def detect(self, frame: Frame) -> List[Tuple[BoundingBox, float]]:
+    def detect(self, frame: Frame) -> List[Detection]:
         """
         Run person/player detection on a single frame.
 
@@ -95,7 +111,7 @@ class YoloDetector:
         frame: Frame,
         player_class_ids: Sequence[int] = PLAYER_CLASS_IDS,
         ball_class_ids: Sequence[int] = BALL_CLASS_IDS,
-    ) -> Tuple[List[Tuple[BoundingBox, float]], List[Tuple[BoundingBox, float]]]:
+    ) -> Tuple[List[Detection], List[Detection]]:
         """
         Run YOLO once and return separate detections for players and ball.
 
@@ -106,12 +122,12 @@ class YoloDetector:
 
         Returns:
             (player_detections, ball_detections) where each element is a list of
-            (bbox, confidence) tuples.
+            :class:`Detection` objects.
         """
         results = self._run_model(frame)  # type: ignore[no-untyped-call]
 
-        player_dets: List[Tuple[BoundingBox, float]] = []
-        ball_dets: List[Tuple[BoundingBox, float]] = []
+        player_dets: List[Detection] = []
+        ball_dets: List[Detection] = []
 
         for result in results:  # type: ignore[attr-defined]
             boxes = result.boxes  # type: ignore[attr-defined]
@@ -121,25 +137,29 @@ class YoloDetector:
             conf = boxes.conf.cpu().numpy()  # type: ignore[attr-defined]
             xyxy = boxes.xyxy.cpu().numpy()  # type: ignore[attr-defined]
             for c, score, box in zip(cls, conf, xyxy):  # type: ignore[arg-type]
-                coords = box.astype(int)  # type: ignore[attr-defined]
-                x1: int = int(coords[0])  # type: ignore[arg-type]
-                y1: int = int(coords[1])  # type: ignore[arg-type]
-                x2: int = int(coords[2])  # type: ignore[arg-type]
-                y2: int = int(coords[3])  # type: ignore[arg-type]
+                box_list: List[float] = list(box.tolist())  # type: ignore[attr-defined]
+                x1: int = int(box_list[0])
+                y1: int = int(box_list[1])
+                x2: int = int(box_list[2])
+                y2: int = int(box_list[3])
                 bbox: BoundingBox = (x1, y1, x2, y2)
+                det = Detection(
+                    bbox=bbox,
+                    confidence=float(score),  # type: ignore[arg-type]
+                    class_id=int(c),  # type: ignore[arg-type]
+                )
                 if c in player_class_ids:
-                    player_dets.append((bbox, float(score)))  # type: ignore[arg-type]
+                    player_dets.append(det)
                 elif c in ball_class_ids:
-                    ball_dets.append((bbox, float(score)))  # type: ignore[arg-type]
+                    ball_dets.append(det)
         return player_dets, ball_dets
 
-    def detect(self, frame: Frame) -> List[Tuple[BoundingBox, float]]:
+    def detect(self, frame: Frame) -> List[Detection]:
         """
-        Run YOLO detection on the given frame and return player bounding boxes.
+        Run YOLO detection on the given frame and return player detections.
 
-        This method is kept for backwards compatibility and returns only
-        player detections. Use :meth:`detect_players_and_ball` when ball
-        detections are also needed.
+        This method returns only player detections. Use
+        :meth:`detect_players_and_ball` when ball detections are also needed.
         """
         players, _ = self.detect_players_and_ball(frame)
         return players
@@ -156,7 +176,7 @@ class DummyDetector:
     for synthetic demo videos.
     """
 
-    def detect(self, frame: Frame) -> List[Tuple[BoundingBox, float]]:
+    def detect(self, frame: Frame) -> List[Detection]:
         return []
 
 
@@ -211,4 +231,7 @@ def detect_players(
         configuration this is typically class_id == 0 (person).
     """
     base_detections = detector.detect(frame)
-    return [(bbox, score, 0) for bbox, score in base_detections]
+    return [
+        (det.bbox, det.confidence, det.class_id)
+        for det in base_detections
+    ]

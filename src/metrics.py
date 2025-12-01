@@ -13,12 +13,15 @@ accelerations, and high-intensity running statistics.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from math import hypot
+from typing import Dict, List, Tuple
 
 import numpy as np
 
 from .tracking import TrackID
 from .calibration import Point2D
+
+TrackPointXY = Tuple[int, float, float]
 
 
 @dataclass
@@ -66,6 +69,50 @@ def compute_distance(positions: List[Point2D]) -> float:
     diffs = np.diff(pts, axis=0)
     segment_lengths = np.linalg.norm(diffs, axis=1)
     return float(segment_lengths.sum())
+
+
+def compute_distance_per_player(
+    track_points_xy: Dict[TrackID, List[TrackPointXY]],
+    fps: float,
+    max_displacement_per_frame: float = 15.0,
+) -> Dict[TrackID, float]:
+    """
+    Compute total distance covered per player in meters.
+
+    Args:
+        track_points_xy: Mapping ``{player_id: [(frame_idx, x, y), ...]}``
+            where ``(x, y)`` are pitch coordinates in meters.
+        fps: Video frame rate in frames per second. The current implementation
+            uses it only for documentation purposes; it can be used later to
+            derive speed-based thresholds.
+        max_displacement_per_frame: Maximum physically plausible displacement
+            between consecutive frames in meters. Segments larger than this
+            are treated as tracking outliers and ignored.
+
+    Returns:
+        Mapping ``{player_id: total_distance_m}`` in meters.
+    """
+    distances: Dict[TrackID, float] = {}
+
+    for player_id, points in track_points_xy.items():
+        if len(points) < 2:
+            distances[player_id] = 0.0
+            continue
+
+        # Ensure we process points in temporal order.
+        sorted_points = sorted(points, key=lambda p: p[0])
+        total = 0.0
+        for (_f0, x0, y0), (_f1, x1, y1) in zip(sorted_points[:-1], sorted_points[1:]):
+            dx = x1 - x0
+            dy = y1 - y0
+            d = hypot(dx, dy)
+            if d > max_displacement_per_frame:
+                # Ignore implausible jumps caused by tracking noise.
+                continue
+            total += d
+        distances[player_id] = total
+
+    return distances
 
 
 def compute_player_metrics(

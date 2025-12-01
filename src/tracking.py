@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Tuple, Protocol, Optional
 
 import numpy as np
 
-from .detection import BoundingBox
+from .detection import BoundingBox, Detection
 
 try:
     from deep_sort_realtime.deepsort_tracker import DeepSort  # type: ignore[import-not-found]
@@ -217,3 +217,61 @@ def create_tracker(
         return DeepSortTracker(max_age=max_age)
     # Default: simple IOU tracker
     return SimpleIouTracker(max_age=max_age, iou_threshold=iou_threshold)
+
+
+@dataclass
+class PlayerTracker:
+    """
+    High-level wrapper around a lower-level :class:`Tracker`.
+
+    This class exposes an interface that accepts :class:`Detection`
+    objects and returns a mapping from persistent player IDs to their
+    current bounding boxes in pixel coordinates.
+    """
+
+    backend: Tracker
+
+    def update(
+        self,
+        detections: List[Detection],
+        frame: Optional[Frame] = None,
+    ) -> Dict[TrackID, BoundingBox]:
+        """
+        Update the underlying tracker using detection results.
+
+        Args:
+            detections: List of :class:`Detection` objects for the frame.
+            frame: Optional image frame for trackers that require it
+                (e.g., DeepSORT for appearance features).
+
+        Returns:
+            Mapping from ``track_id`` to bounding boxes in pixel coordinates.
+        """
+        det_tuples: List[Tuple[BoundingBox, float]] = [
+            (det.bbox, det.confidence) for det in detections
+        ]
+        return self.backend.update(det_tuples, frame=frame)
+
+
+def create_player_tracker(
+    tracker_type: str = "simple_iou",
+    max_age: int = 30,
+    iou_threshold: float = 0.3,
+) -> PlayerTracker:
+    """
+    Factory for creating a :class:`PlayerTracker` instance.
+
+    Args:
+        tracker_type: Which backend to use: "simple_iou" or "deepsort".
+        max_age: Maximum number of frames to keep tracks without detections.
+        iou_threshold: Association IoU threshold for the simple IOU tracker.
+
+    Returns:
+        A :class:`PlayerTracker` using the configured backend.
+    """
+    backend = create_tracker(
+        tracker_type=tracker_type,
+        max_age=max_age,
+        iou_threshold=iou_threshold,
+    )
+    return PlayerTracker(backend=backend)

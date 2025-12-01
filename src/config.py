@@ -53,6 +53,9 @@ class Config:
     tracking_max_age: int = 30
     tracking_iou_threshold: float = 0.3
     tracker_type: str = "simple_iou"  # or "deepsort"
+    use_dummy_detector: bool = True  # fallback to dummy when YOLO unavailable
+    player_class_ids: tuple[int, ...] = (0,)  # YOLO class ids for players/person
+    ball_class_ids: tuple[int, ...] = (1,)    # YOLO class ids for ball
 
     # Standard football pitch dimensions (can be adjusted).
     pitch_length_m: float = 105.0
@@ -61,6 +64,9 @@ class Config:
     calibration_file: Optional[Path] = Path("data") / "calibration_points.json"
 
     frame_stride: int = 1
+    max_frames: Optional[int] = None  # limit number of processed frames (None = all)
+    possession_radius_m: float = 2.0  # max distance player-ball to count possession
+    sample_interval_s: Optional[float] = None  # if set, overrides frame_stride using fps
 
     enable_visualization: bool = True
     write_annotated_video: bool = True

@@ -1,219 +1,86 @@
 """
-Camera-to-pitch calibration and coordinate transformations.
+Homography-based calibration for mapping image pixels to pitch meters.
 
-This module deals with mapping pixel coordinates (image space) to metric
-coordinates on the pitch using a planar homography.
-
-The key idea is that **all distances must be measured on the pitch in
-meters**, not directly in pixels. A player who moves the same number of
-pixels near the camera and far away does not necessarily cover the same
-physical distance because of perspective effects. The homography uses
-manually selected point correspondences to map from image coordinates
-``(u, v)`` to pitch coordinates ``(x, y)`` in meters.
-
-Expected calibration file format (JSON):
-
-    {
-        "image_points": [[u1, v1], [u2, v2], ...],
-        "pitch_points": [[x1, y1], [x2, y2], ...]
-    }
-
-Each video (and camera viewpoint) should have its own calibration file
-and its own pitch dimensions. This allows the same code to work for
-5-a-side, 7-a-side, and 11-a-side pitches without mixing distances
-between different field sizes.
-
-The design also leaves room for a future semi-automatic mode where the
-pitch lines (sidelines, boxes, center circle) are detected automatically
-and used to infer the scale and homography.
+This module assumes a fixed, high-angle tactical camera where the full 11v11
+pitch is visible (goalkeepers may hug the edges and occasionally leave the
+frame). Distances must be computed **after** mapping to pitch coordinates; never
+use pixel distances directly.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple
 
 import cv2
 import numpy as np
 
+from .calibration_data import CalibrationSample, CalibrationSet, load_calibration
+from .data_structures import PitchMeta, PitchPointUV, PitchPointXY
+
+PointUV = Tuple[float, float]
+PointXY = Tuple[float, float]
 Point2D = Tuple[float, float]
-HomographyMatrix = np.ndarray[Any, np.dtype[np.float32]]
+Homography = np.ndarray
 
 
-def compute_homography(
-    image_points: Sequence[Point2D],
-    pitch_points: Sequence[Point2D],
-) -> HomographyMatrix:
+def _compute_homography(uv_points: Sequence[PointUV], xy_points: Sequence[PointXY]) -> Homography:  # type: ignore[misc]
     """
-    Estimate a 3x3 homography matrix from corresponding points.
-
-    Args:
-        image_points: Points in image/pixel coordinates ``(u, v)``.
-        pitch_points: Corresponding points in pitch coordinates ``(x, y)``
-            in meters, using any consistent pitch coordinate system.
-
-    Returns:
-        A ``3x3`` homography matrix ``H`` that maps ``(u, v, 1)`` to
-        ``(x, y, w)`` in homogeneous coordinates.
-
-    Raises:
-        ValueError: If homography estimation fails (e.g., degenerate
-        or insufficient point configuration).
+    Estimate a 3x3 homography mapping image (u, v) -> pitch (x, y) using RANSAC.
     """
-    img = np.asarray(image_points, dtype=np.float32)
-    pitch = np.asarray(pitch_points, dtype=np.float32)
-    if img.shape != pitch.shape or img.shape[0] < 4:
-        raise ValueError(
-            "Homography requires at least 4 point pairs with matching shapes."
-        )
-    H, _ = cv2.findHomography(img, pitch, method=cv2.RANSAC)  # type: ignore[misc]
-    # cv2.findHomography can theoretically return None, but typing says otherwise
-    if H is None:  # type: ignore[unreachable]  # pragma: no cover - defensive check
-        raise ValueError("Failed to compute homography; check your points.")
-    return np.asarray(H, dtype=np.float32)
-
-
-def image_to_pitch(
-    points_uv: Iterable[Point2D],
-    H: HomographyMatrix,
-) -> List[Point2D]:
-    """
-    Transform a batch of image points to pitch coordinates.
-
-    Args:
-        points_uv: Iterable of image coordinates ``(u, v)`` in pixels.
-        H: Homography matrix mapping image to pitch coordinates.
-
-    Returns:
-        List of pitch coordinates ``(x, y)`` in meters.
-    """
-    pts_list = list(points_uv)
-    if not pts_list:
-        return []
-    pts = np.asarray(pts_list, dtype=np.float32).reshape(-1, 1, 2)
-    pts_pitch = cv2.perspectiveTransform(pts, H).reshape(-1, 2)
-    return [(float(x), float(y)) for x, y in pts_pitch]
+    uv = np.asarray(uv_points, dtype=np.float32)
+    xy = np.asarray(xy_points, dtype=np.float32)
+    if uv.shape != xy.shape or uv.shape[0] < 4:
+        raise ValueError("Homography requires >=4 point pairs with matching shapes.")
+    H, _ = cv2.findHomography(uv, xy, method=cv2.RANSAC)  # type: ignore[misc]
+    if H is None:  # type: ignore[unreachable]
+        raise ValueError("Failed to compute homography; check calibration points.")
+    return H.astype(np.float32)
 
 
 @dataclass
 class PitchCalibrator:
     """
-    Handles estimation and application of a planar homography for a pitch.
+    Applies a planar homography to map pixel coordinates to pitch meters.
 
     Attributes:
-        H: 3x3 homography matrix mapping image coordinates to pitch coordinates.
-        pitch_length_m: Length of the pitch in meters.
-        pitch_width_m: Width of the pitch in meters.
-
-    The world coordinate system is assumed to be:
-        - Origin ``(0, 0)`` at one pitch corner.
-        - ``x`` axis along the pitch length.
-        - ``y`` axis along the pitch width.
-
-    Distances for players and the ball should **always** be computed after
-    mapping to this metric coordinate system. Direct distances in pixels
-    are not physically meaningful because of perspective distortion.
+        calibration: CalibrationSet containing pitch metadata and point pairs.
+        H: 3x3 homography matrix mapping (u, v, 1) -> (x, y, w).
     """
 
-    H: HomographyMatrix
-    pitch_length_m: float
-    pitch_width_m: float
+    calibration: CalibrationSet
+    H: Homography  # type: ignore[misc]
 
     @classmethod
-    def from_correspondences(
-        cls,
-        image_points: List[Point2D],
-        pitch_points: List[Point2D],
-        pitch_length_m: float,
-        pitch_width_m: float,
-    ) -> "PitchCalibrator":
+    def from_calibration(cls, calibration: CalibrationSet) -> "PitchCalibrator":
         """
-        Create a calibrator from point correspondences.
-
-        Args:
-            image_points: At least four points in image coordinates.
-            pitch_points: Corresponding points in pitch coordinates (meters).
-            pitch_length_m: Length of the pitch in meters.
-            pitch_width_m: Width of the pitch in meters.
-
-        Returns:
-            A :class:`PitchCalibrator` instance with the estimated homography.
+        Build a calibrator from a CalibrationSet.
         """
-        H = compute_homography(image_points, pitch_points)
-        return cls(H=H, pitch_length_m=pitch_length_m, pitch_width_m=pitch_width_m)
+        uv_points = [(s.image_point.u, s.image_point.v) for s in calibration.samples]
+        xy_points = [(s.world_point.x, s.world_point.y) for s in calibration.samples]
+        H: Homography = _compute_homography(uv_points, xy_points)  # type: ignore[misc]
+        return cls(calibration=calibration, H=H)
 
-    @classmethod
-    def from_json(
-        cls,
-        path: Path,
-        pitch_length_m: float | None = None,
-        pitch_width_m: float | None = None,
-    ) -> "PitchCalibrator":
+    def image_to_pitch(self, u: float, v: float) -> Tuple[float, float]:
         """
-        Load point correspondences from JSON and compute the homography.
-
-        The JSON file should contain ``image_points`` and ``pitch_points``.
-        Pitch dimensions can either be provided here in the JSON (optional)
-        or passed explicitly via ``pitch_length_m`` and ``pitch_width_m``
-        from a config file or CLI arguments.
+        Map a single pixel coordinate (u, v) to pitch meters (x, y).
         """
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
+        pts = np.asarray([[[u, v]]], dtype=np.float32)
+        mapped = cv2.perspectiveTransform(pts, self.H).reshape(-1, 2)  # type: ignore[arg-type]
+        x, y = mapped[0]
+        return float(x), float(y)
 
-        image_points = data["image_points"]
-        pitch_points = data["pitch_points"]
-
-        # Allow optional pitch dimensions inside the JSON as a fallback.
-        json_length = data.get("pitch_length_m") or data.get("pitch_length")
-        json_width = data.get("pitch_width_m") or data.get("pitch_width")
-
-        length = float(pitch_length_m if pitch_length_m is not None else json_length or 0.0)
-        width = float(pitch_width_m if pitch_width_m is not None else json_width or 0.0)
-
-        # As a last resort, if dimensions are still zero, infer them from
-        # the max extents of the world points. This is only a heuristic.
-        if (length <= 0.0 or width <= 0.0) and pitch_points:
-            xs = [p[0] for p in pitch_points]
-            ys = [p[1] for p in pitch_points]
-            length = float(max(xs) - min(xs))
-            width = float(max(ys) - min(ys))
-
-        if length <= 0.0 or width <= 0.0:
-            raise ValueError(
-                "Pitch dimensions could not be determined. Provide pitch_length_m "
-                "and pitch_width_m via config/CLI or in the calibration JSON."
-            )
-
-        return cls.from_correspondences(
-            image_points=image_points,
-            pitch_points=pitch_points,
-            pitch_length_m=length,
-            pitch_width_m=width,
-        )
-
-    def image_point_to_pitch(self, point: Point2D) -> Point2D:
+    def batch_image_to_pitch(self, points_uv: Iterable[PointUV]) -> List[PointXY]:
         """
-        Map a single image point ``(u, v)`` to pitch coordinates ``(x, y)``.
+        Map a batch of pixel coordinates to pitch meters.
         """
-        x, y = image_to_pitch([point], self.H)[0]
-        return x, y
-
-    def bbox_center_to_pitch(self, bbox: Tuple[int, int, int, int]) -> Point2D:
-        """
-        Convenience helper: map bounding-box center to pitch coordinates.
-
-        Args:
-            bbox: Bounding box ``(x1, y1, x2, y2)`` in pixels.
-
-        Returns:
-            Center of the box in pitch coordinates ``(x, y)`` in meters.
-        """
-        x1, y1, x2, y2 = bbox
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-        return self.image_point_to_pitch((cx, cy))
+        pts_list = list(points_uv)
+        if not pts_list:
+            return []
+        pts = np.asarray(pts_list, dtype=np.float32).reshape(-1, 1, 2)
+        mapped = cv2.perspectiveTransform(pts, self.H).reshape(-1, 2)  # type: ignore[arg-type]
+        return [(float(x), float(y)) for x, y in mapped]
 
 
 def load_calibrator(
@@ -222,22 +89,34 @@ def load_calibrator(
     pitch_width_m: float,
 ) -> PitchCalibrator:
     """
-    Load a :class:`PitchCalibrator` from a JSON file.
+    Compatibility helper for loading a calibrator from disk.
 
-    The calibration file contains the point correspondences, while the
-    pitch dimensions (length/width in meters) are provided by the user
-    via a config file or CLI arguments. This ensures that distances are
-    always expressed in the correct units for the specific pitch size.
-
-    TODO: Support caching computed homographies and multiple camera setups.
+    Supports both the new CalibrationSet schema and the legacy
+    ``{\"image_points\": [[...]], \"pitch_points\": [[...]]}`` layout.
     """
-    if not calibration_file.exists():
-        raise FileNotFoundError(
-            f"Calibration file {calibration_file} not found. "
-            f"Create it with manually selected correspondences."
-        )
-    return PitchCalibrator.from_json(
-        calibration_file,
-        pitch_length_m=pitch_length_m,
-        pitch_width_m=pitch_width_m,
+    with calibration_file.open("r", encoding="utf-8") as f:
+        import json
+
+        data = json.load(f)
+
+    if "samples" in data or "pitch_meta" in data:
+        calib_set = load_calibration(calibration_file)
+        return PitchCalibrator.from_calibration(calib_set)
+
+    # Legacy format.
+    image_points = data["image_points"]
+    pitch_points = data["pitch_points"]
+    pitch_meta = PitchMeta(
+        pitch_type=str(data.get("pitch_type", "unknown")),
+        length_m=float(data.get("pitch_length_m", pitch_length_m)),
+        width_m=float(data.get("pitch_width_m", pitch_width_m)),
     )
+    samples = [
+        CalibrationSample(
+            image_point=PitchPointUV(u=float(u), v=float(v)),
+            world_point=PitchPointXY(x=float(x), y=float(y)),
+        )
+        for (u, v), (x, y) in zip(image_points, pitch_points)
+    ]
+    calib_set = CalibrationSet(pitch_meta=pitch_meta, samples=samples)
+    return PitchCalibrator.from_calibration(calib_set)

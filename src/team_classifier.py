@@ -45,6 +45,7 @@ class SimpleColorTeamClassifier:
     """
 
     learning_rate: float = 0.1
+    ref_distance_threshold: float = 35.0  # HSV distance beyond which we consider "Ref"
     min_samples_for_kmeans: int = 4
     kmeans_max_iters: int = 10
     team_colors_hsv: Dict[TeamLabel, np.ndarray[Any, np.dtype[np.float32]]] = field(default_factory=dict)  # type: ignore[misc]
@@ -125,6 +126,10 @@ class SimpleColorTeamClassifier:
             if dist < best_dist:
                 best_dist = dist
                 best_label = label
+
+        # If far from both team prototypes, treat as referee.
+        if best_dist > self.ref_distance_threshold and len(self.team_colors_hsv) >= 2:
+            return "Ref"
 
         # Update prototype with running mean
         proto = self.team_colors_hsv[best_label]  # type: ignore[index]

@@ -18,13 +18,13 @@ from typing import Any, List
 import cv2
 import numpy as np
 
-from .calibration import Point2D
+from .calibration import PointXY
 
 HeatmapArray = np.ndarray[Any, np.dtype[np.uint8]]
 
 
 def create_heatmap(
-    positions: List[Point2D],
+    positions: List[PointXY],
     pitch_size: tuple[float, float],
     resolution: tuple[int, int] = (1050, 680),
 ) -> HeatmapArray:

@@ -1,0 +1,23 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.local
+
+# Node/Next.js artifacts
+node_modules/
+**/node_modules/
+frontend/.next/
+frontend/.turbo/
+frontend/.pnp.cjs
+frontend/.pnp.loader.mjs
+frontend/pnpm-lock.yaml
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.log

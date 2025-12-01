@@ -1,37 +1,41 @@
 """
-Computation of player movement metrics such as distance and speed.
+Distance and basic movement metrics computed in pitch coordinates (meters).
 
-This module takes tracked positions over time (in pitch coordinates) and
-computes aggregate statistics per player.
-
-Distances are computed in meters and can optionally be converted to km.
-
-TODO: Extend metrics to include instantaneous and average speed,
-accelerations, and high-intensity running statistics.
+Distances are only valid after calibration; never use pixel distances. The video
+dataset uses a static, high-angle camera where nearly the full pitch is visible.
+Goalkeepers may leave the frame; mark those segments ``visible=False`` to avoid
+adding distance during gaps.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import hypot
-from typing import Dict, List, Tuple
+from math import hypot, isnan
+from typing import Dict, List, Mapping, Tuple
 
-import numpy as np
+from .data_structures import PlayerPitchPoint
 
-from .tracking import TrackID
-from .calibration import Point2D
+Point2D = Tuple[float, float]
 
-TrackPointXY = Tuple[int, float, float]
+
+@dataclass
+class PlayerDistance:
+    """
+    Aggregate distance metrics for a player.
+    """
+
+    player_id: int
+    distance_m: float
+
+    @property
+    def distance_km(self) -> float:
+        return self.distance_m / 1000.0
 
 
 @dataclass
 class PlayerMetrics:
     """
-    Stores per-player movement metrics.
-
-    Attributes:
-        total_distance_m: Total distance covered in meters.
-        positions: List of (X, Y) positions in meters over time.
+    Compatibility struct for pre-existing pipeline code.
     """
 
     total_distance_m: float
@@ -39,95 +43,91 @@ class PlayerMetrics:
 
     @property
     def total_distance_km(self) -> float:
-        """
-        Total distance covered in kilometers.
-        """
         return self.total_distance_m / 1000.0
 
 
 @dataclass
 class BallMetrics:
-    """
-    Stores ball movement metrics.
-
-    Attributes:
-        total_distance_m: Total distance the ball traveled in meters.
-        positions: List of (X, Y) positions in meters over time.
-    """
-
     total_distance_m: float
     positions: List[Point2D]
 
 
 def compute_distance(positions: List[Point2D]) -> float:
     """
-    Compute total path length from a sequence of positions.
+    Compute total path length from a sequence of (x, y) points.
     """
     if len(positions) < 2:
         return 0.0
-    pts = np.array(positions, dtype=np.float32)
-    diffs = np.diff(pts, axis=0)
-    segment_lengths = np.linalg.norm(diffs, axis=1)
-    return float(segment_lengths.sum())
+    total = 0.0
+    for (x0, y0), (x1, y1) in zip(positions[:-1], positions[1:]):
+        total += hypot(x1 - x0, y1 - y0)
+    return total
+
+
+def _valid_segment(p0: PlayerPitchPoint, p1: PlayerPitchPoint) -> bool:
+    """
+    Check visibility and finite coordinates before computing displacement.
+    """
+    if not (p0.visible and p1.visible):
+        return False
+    if any(isnan(v) for v in (p0.x, p0.y, p1.x, p1.y)):
+        return False
+    return True
 
 
 def compute_distance_per_player(
-    track_points_xy: Dict[TrackID, List[TrackPointXY]],
-    fps: float,
-    max_displacement_per_frame: float = 15.0,
-) -> Dict[TrackID, float]:
+    tracks_xy: Mapping[int, List[PlayerPitchPoint]],
+    fps: float = 25.0,
+    max_speed_m_per_s: float = 10.0,
+) -> Dict[int, float]:
     """
     Compute total distance covered per player in meters.
 
-    Args:
-        track_points_xy: Mapping ``{player_id: [(frame_idx, x, y), ...]}``
-            where ``(x, y)`` are pitch coordinates in meters.
-        fps: Video frame rate in frames per second. The current implementation
-            uses it only for documentation purposes; it can be used later to
-            derive speed-based thresholds.
-        max_displacement_per_frame: Maximum physically plausible displacement
-            between consecutive frames in meters. Segments larger than this
-            are treated as tracking outliers and ignored.
-
-    Returns:
-        Mapping ``{player_id: total_distance_m}`` in meters.
+    Rules:
+    - Segments with ``visible=False`` are skipped.
+    - Speed is derived from frame delta / fps; segments exceeding
+      ``max_speed_m_per_s`` are treated as outliers and ignored.
     """
-    distances: Dict[TrackID, float] = {}
-
-    for player_id, points in track_points_xy.items():
-        if len(points) < 2:
+    distances: Dict[int, float] = {}
+    for player_id, pts in tracks_xy.items():
+        if len(pts) < 2:
             distances[player_id] = 0.0
             continue
-
-        # Ensure we process points in temporal order.
-        sorted_points = sorted(points, key=lambda p: p[0])
+        pts_sorted = sorted(pts, key=lambda p: p.frame_index)
         total = 0.0
-        for (_f0, x0, y0), (_f1, x1, y1) in zip(sorted_points[:-1], sorted_points[1:]):
-            dx = x1 - x0
-            dy = y1 - y0
-            d = hypot(dx, dy)
-            if d > max_displacement_per_frame:
-                # Ignore implausible jumps caused by tracking noise.
+        for p0, p1 in zip(pts_sorted[:-1], pts_sorted[1:]):
+            if p1.frame_index <= p0.frame_index:
                 continue
-            total += d
+            if not _valid_segment(p0, p1):
+                continue
+            dt = (p1.frame_index - p0.frame_index) / fps
+            if dt <= 0:
+                continue
+            dx = p1.x - p0.x
+            dy = p1.y - p0.y
+            dist = hypot(dx, dy)
+            speed = dist / dt
+            if speed > max_speed_m_per_s:
+                continue
+            total += dist
         distances[player_id] = total
-
     return distances
 
 
+def summarize_distances_km(distances_m: Mapping[int, float]) -> Dict[int, float]:
+    """
+    Convert per-player distances (meters) to kilometers.
+    """
+    return {pid: dist_m / 1000.0 for pid, dist_m in distances_m.items()}
+
+
 def compute_player_metrics(
-    track_positions: Dict[TrackID, List[Point2D]]
-) -> Dict[TrackID, PlayerMetrics]:
+    track_positions: Mapping[int, List[Point2D]],
+) -> Dict[int, PlayerMetrics]:
     """
-    Compute basic metrics for each player.
-
-    Args:
-        track_positions: Mapping from track ID to list of pitch positions over time.
-
-    Returns:
-        Mapping from track ID to :class:`PlayerMetrics`.
+    Compatibility helper: compute per-player distance for plain (x, y) tuples.
     """
-    metrics: Dict[TrackID, PlayerMetrics] = {}
+    metrics: Dict[int, PlayerMetrics] = {}
     for track_id, positions in track_positions.items():
         dist = compute_distance(positions)
         metrics[track_id] = PlayerMetrics(total_distance_m=dist, positions=positions)
@@ -135,18 +135,12 @@ def compute_player_metrics(
 
 
 def compute_ball_metrics(
-    ball_positions: Dict[TrackID, List[Point2D]]
-) -> Dict[TrackID, BallMetrics]:
+    ball_positions: Mapping[int, List[Point2D]],
+) -> Dict[int, BallMetrics]:
     """
-    Compute basic metrics for each ball track.
-
-    Args:
-        ball_positions: Mapping from ball track ID to list of pitch positions.
-
-    Returns:
-        Mapping from ball track ID to :class:`BallMetrics`.
+    Compatibility helper mirroring compute_player_metrics.
     """
-    metrics: Dict[TrackID, BallMetrics] = {}
+    metrics: Dict[int, BallMetrics] = {}
     for ball_id, positions in ball_positions.items():
         dist = compute_distance(positions)
         metrics[ball_id] = BallMetrics(total_distance_m=dist, positions=positions)

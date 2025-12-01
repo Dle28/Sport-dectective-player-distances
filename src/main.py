@@ -42,13 +42,13 @@ from .config import DEFAULT_CONFIG, Config
 from .detection import Detection, YoloDetector, create_detector
 from .tracking import TrackID, create_player_tracker
 from .team_classifier import TeamLabel, create_team_classifier
-from .calibration import Point2D, load_calibrator
+from .calibration import PointXY, load_calibrator
+from .data_structures import PlayerPitchPoint, PitchMeta
 from .metrics import (
-    TrackPointXY,
-    compute_ball_metrics,
     compute_distance_per_player,
     compute_player_metrics,
 )
+from .tracking_data import PitchTrackStore
 from .heatmap import create_heatmap, save_heatmap
 from .visualization import draw_tracks, overlay_heatmap_on_pitch
 from .utils.video_io import open_video, open_video_writer
@@ -154,6 +154,14 @@ def build_config_from_args(args: argparse.Namespace) -> Config:
         config.pitch_length_m = float(args.pitch_length)
     if args.pitch_width is not None:
         config.pitch_width_m = float(args.pitch_width)
+    if getattr(args, "frame_stride", None) is not None:
+        config.frame_stride = max(1, int(args.frame_stride))
+    if getattr(args, "max_frames", None) is not None:
+        config.max_frames = int(args.max_frames)
+    if getattr(args, "force_yolo", False):
+        config.use_dummy_detector = False
+    if getattr(args, "sample_interval_s", None) is not None:
+        config.sample_interval_s = float(args.sample_interval_s)
 
     return config
 
@@ -170,7 +178,7 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
         conf_threshold=config.detection_conf_threshold,
         iou_threshold=config.detection_iou_threshold,
         classes=config.detection_classes,
-        use_dummy_if_unavailable=True,
+        use_dummy_if_unavailable=config.use_dummy_detector,
     )
     player_tracker = create_player_tracker(
         tracker_type=config.tracker_type,
@@ -195,12 +203,15 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
 
     video = open_video(config.input_video)
     fps = video.fps
+    # If requested, derive frame_stride from sample interval.
+    if config.sample_interval_s is not None:
+        config.frame_stride = max(1, int(round(fps * config.sample_interval_s)))
 
     # Track positions in pitch coordinates for each player and ball over time.
-    track_positions: Dict[TrackID, List[Point2D]] = {}
-    ball_positions: Dict[TrackID, List[Point2D]] = {}
+    track_positions: Dict[TrackID, List[PointXY]] = {}
+    ball_positions: Dict[TrackID, List[PointXY]] = {}
     # Track positions with frame indices for robust distance computation.
-    track_points_xy: Dict[TrackID, List[TrackPointXY]] = {}
+    track_points_xy: Dict[TrackID, List[PlayerPitchPoint]] = {}
     # Optional: raw pixel-space positions (frame_idx, u, v) for debugging/export.
     pixel_track_points_uv: Dict[TrackID, List[Tuple[int, float, float]]] = {}
 
@@ -217,10 +228,14 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
 
     try:
         for frame_idx, frame in video.frames(stride=config.frame_stride):
+            if config.max_frames is not None and frame_idx >= config.max_frames:
+                break
             # Run detection; if using YOLO, get both players and ball.
             if isinstance(detector, YoloDetector):
                 player_detections, ball_detections = detector.detect_players_and_ball(
-                    frame
+                    frame,
+                    player_class_ids=config.player_class_ids,
+                    ball_class_ids=config.ball_class_ids,
                 )
             else:
                 player_detections = detector.detect(frame)
@@ -233,42 +248,66 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
                 else {}
             )
 
-            # Classify each track into a team.
-            team_labels = team_classifier.classify_tracks(frame, player_tracks)
-            track_team_labels.update(team_labels)
-
-            # Pre-compute centers of all player boxes in pixels.
+            # Filter tracks to only those inside the pitch bounds (with small margin) if calibration is available.
+            filtered_player_tracks: Dict[TrackID, Tuple[int, int, int, int]] = {}
             frame_player_centers_uv: Dict[TrackID, Tuple[float, float]] = {}
+            margin_m = 3.0
             for track_id, bbox in player_tracks.items():
                 x1, y1, x2, y2 = bbox
                 u = (x1 + x2) / 2.0
                 v = (y1 + y2) / 2.0
                 center_uv = (float(u), float(v))
+
+                if calibrator is not None:
+                    px, py = calibrator.image_to_pitch(center_uv[0], center_uv[1])
+                    if (
+                        px < -margin_m
+                        or px > config.pitch_length_m + margin_m
+                        or py < -margin_m
+                        or py > config.pitch_width_m + margin_m
+                    ):
+                        # Skip people clearly outside the pitch (spectators/benches).
+                        continue
+
                 frame_player_centers_uv[track_id] = center_uv
+                filtered_player_tracks[track_id] = bbox
                 pixel_track_points_uv.setdefault(track_id, []).append(
                     (frame_idx, center_uv[0], center_uv[1])
                 )
 
+            # Classify each track into a team/ref.
+            team_labels = team_classifier.classify_tracks(frame, filtered_player_tracks)
+            track_team_labels.update(team_labels)
+
             # Convert track positions from image to pitch coordinates.
             if calibrator is not None:
-                frame_player_positions: Dict[TrackID, Point2D] = {}
+                frame_player_positions: Dict[TrackID, PointXY] = {}
                 for track_id, center_uv in frame_player_centers_uv.items():
-                    pt = calibrator.image_point_to_pitch(center_uv)
+                    u, v = center_uv
+                    pt = calibrator.image_to_pitch(u, v)
                     track_positions.setdefault(track_id, []).append(pt)
                     frame_player_positions[track_id] = pt
                     # Store time-stamped pitch coordinates for distance metrics.
                     track_points_xy.setdefault(track_id, []).append(
-                        (frame_idx, pt[0], pt[1])
+                        PlayerPitchPoint(
+                            frame_index=frame_idx,
+                            player_id=track_id,
+                            x=pt[0],
+                            y=pt[1],
+                            visible=True,
+                        )
                     )
 
-                frame_ball_positions: Dict[TrackID, Point2D] = {}
+                frame_ball_positions: Dict[TrackID, PointXY] = {}
                 for ball_id, bbox in ball_tracks.items():
-                    pt = calibrator.bbox_center_to_pitch(bbox)
+                    x1, y1, x2, y2 = bbox
+                    u, v = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                    pt = calibrator.image_to_pitch(u, v)
                     ball_positions.setdefault(ball_id, []).append(pt)
                     frame_ball_positions[ball_id] = pt
 
                 # Update possession statistics: which player is closest to
-                # the ball this frame (within 2 meters).
+                # the ball this frame (within configured radius).
                 if frame_ball_positions and frame_player_positions:
                     # For now, assume a single detected ball per frame.
                     _, ball_pt = next(iter(frame_ball_positions.items()))
@@ -279,12 +318,14 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
                         if dist < closest_dist:
                             closest_dist = dist
                             closest_id = track_id
-                    if closest_id is not None and closest_dist < 2.0:
+                    if closest_id is not None and closest_dist < config.possession_radius_m:
                         possession_frames[closest_id] += 1
+            else:
+                frame_ball_positions = {}
 
             # Draw overlays for visualization/debugging.
             if config.enable_visualization or config.write_annotated_video:
-                vis = draw_tracks(frame, player_tracks, team_labels)
+                vis = draw_tracks(frame, filtered_player_tracks, team_labels)
             else:
                 vis = frame
 
@@ -306,6 +347,28 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
             writer.release()
         cv2.destroyAllWindows()
 
+    # Select active player IDs: team A/B only, prioritize tracks with most observations.
+    def _select_active_players(
+        min_players: int = 20, max_players: int = 22
+    ) -> List[TrackID]:
+        candidates: List[Tuple[TrackID, int]] = []
+        for track_id, label in track_team_labels.items():
+            if label not in ("A", "B"):
+                continue
+            candidates.append((track_id, len(track_points_xy.get(track_id, []))))
+        candidates.sort(key=lambda p: p[1], reverse=True)
+        if len(candidates) >= min_players:
+            chosen = candidates[:max_players]
+        else:
+            chosen = candidates
+        return [tid for tid, _ in chosen]
+
+    active_player_ids = set(_select_active_players())
+    track_positions = {tid: pts for tid, pts in track_positions.items() if tid in active_player_ids}
+    track_points_xy = {tid: pts for tid, pts in track_points_xy.items() if tid in active_player_ids}
+    track_team_labels = {tid: lbl for tid, lbl in track_team_labels.items() if tid in active_player_ids}
+    possession_frames = {tid: cnt for tid, cnt in possession_frames.items() if tid in active_player_ids}
+
     if calibrator is None:
         # Without calibration, we cannot compute metric distances.
         print("No calibration provided; skipping distance metrics.")
@@ -313,7 +376,6 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
 
     # Compute metrics once all frames have been processed.
     metrics = compute_player_metrics(track_positions)
-    _ball_metrics = compute_ball_metrics(ball_positions) if ball_positions else {}
 
     # Distance per player with simple outlier rejection.
     distance_per_player = compute_distance_per_player(track_points_xy, fps=fps)
@@ -323,7 +385,21 @@ def run_pipeline(config: Config = DEFAULT_CONFIG) -> None:
         track_id: frame_count / fps for track_id, frame_count in possession_frames.items()
     }
 
-    # Save a simple heatmap for one player (e.g., the first track).
+    # Export pitch-space tracks for the frontend dashboard.
+    tracks_store = PitchTrackStore(
+        fps=fps,
+        video_path=str(config.input_video),
+        pitch_meta=PitchMeta(
+            pitch_type=str(config.pitch_length_m),
+            length_m=config.pitch_length_m,
+            width_m=config.pitch_width_m,
+            description=None,
+        ),
+        tracks=track_points_xy,
+    )
+    tracks_store.to_json(config.stats_dir / "player_tracks_xy.json")
+
+    # Save a simple heatmap for one player (e.g., the first active track).
     if metrics:
         first_track_id = next(iter(metrics.keys()))
         player_metrics = metrics[first_track_id]
@@ -443,6 +519,26 @@ def main() -> None:
             "Optional path to YAML config file "
             "(defaults to config.yaml in the project root)."
         ),
+    )
+    parser.add_argument(
+        "--frame_stride",
+        type=int,
+        help="Process every N-th frame for speed/coverage (default from config.py).",
+    )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        help="Process only the first N frames (useful for quick tests).",
+    )
+    parser.add_argument(
+        "--force_yolo",
+        action="store_true",
+        help="Disable dummy detector fallback; require YOLO to be available.",
+    )
+    parser.add_argument(
+        "--sample_interval_s",
+        type=float,
+        help="Sample every N seconds (overrides frame_stride; stride is derived from video fps).",
     )
 
     args = parser.parse_args()

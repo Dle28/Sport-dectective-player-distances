@@ -237,6 +237,54 @@ Example `player_distances.json` snippet:
 Always calibrate **per video** with the correct pitch dimensions; do not
 reuse `H` or pitch sizes between different camera setups or fields.
 
+## Data layer usage
+
+Suggested folders for multiple matches:
+
+- `data/raw/` – source mp4 files (e.g., `data/raw/5ph.mp4`).
+- `data/calibration/` – calibration JSON per video.
+- `data/tracks_px/` – pixel-space tracks (`frame_index,u,v,visible`).
+- `data/tracks_xy/` – pitch-space tracks (`frame_index,x,y,visible`).
+- `data/metrics/` – per-player distance and aggregated stats.
+
+Minimal example with the new data structures:
+
+```python
+from pathlib import Path
+from src.video_io import VideoReader
+from src.data_structures import FrameInfo, PlayerTrackPoint, PlayerPitchPoint, PitchMeta, PitchPointUV, PitchPointXY
+from src.tracking_data import PixelTrackStore, PitchTrackStore
+from src.calibration_data import CalibrationSample, CalibrationSet, save_calibration
+
+# 1) Read frames (subsample every 5th frame for a quick prototype run).
+reader = VideoReader(Path("data/raw/5ph.mp4"), stride=5)
+pixel_tracks = PixelTrackStore(fps=reader.fps, video_path=reader.path)
+for frame_idx, frame in reader:
+    frame_info = FrameInfo.from_index(frame_idx, reader.fps)
+    # Example: add a detected player center; mark visible=False if they leave the frame (goalkeepers often hug edges).
+    pixel_tracks.add_point(
+        PlayerTrackPoint(frame_index=frame_idx, player_id=3, u=123.4, v=567.8, visible=True)
+    )
+pixel_tracks.to_json(Path("data/tracks_px/5ph_tracks.json"))
+pixel_tracks.to_csv(Path("data/tracks_px/5ph_tracks.csv"))
+
+# 2) Save a calibration for this static tactical cam.
+pitch_meta = PitchMeta(pitch_type="11v11", length_m=105.0, width_m=68.0, description="static high-angle, 25 fps")
+calibration = CalibrationSet(
+    pitch_meta=pitch_meta,
+    samples=[
+        CalibrationSample(PitchPointUV(u=150.0, v=1020.0), PitchPointXY(x=0.0, y=0.0)),
+        CalibrationSample(PitchPointUV(u=860.0, v=120.0), PitchPointXY(x=105.0, y=68.0)),
+    ],
+)
+save_calibration(calibration, Path("data/calibration/5ph_calibration.json"))
+
+# 3) After applying homography elsewhere, store pitch-space tracks.
+pitch_tracks = PitchTrackStore(fps=reader.fps, video_path=reader.path)
+pitch_tracks.add_point(PlayerPitchPoint(frame_index=10, player_id=3, x=52.3, y=33.8, visible=True))
+pitch_tracks.to_json(Path("data/tracks_xy/5ph_tracks.json"))
+```
+
 ## TODO / next steps
 
 - Replace the simple IoU tracker with a stronger backend (DeepSORT,

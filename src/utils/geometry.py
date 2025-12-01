@@ -10,14 +10,14 @@ projections, and zone definitions.
 
 from __future__ import annotations
 
-from typing import Tuple
+# No typing imports needed
 
 import numpy as np
 
-from ..calibration import Point2D
+from ..calibration import PointXY
 
 
-def euclidean_distance(a: Point2D, b: Point2D) -> float:
+def euclidean_distance(a: PointXY, b: PointXY) -> float:
     """
     Compute Euclidean distance between two 2D points.
     """
